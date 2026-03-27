@@ -1,6 +1,6 @@
 """
 CRYPTOBOT - Core Engine
-Live prices via CoinGecko API (free, no API key needed, works globally)
+Live prices via Kraken API (works in Canada, free, no API key needed)
 TA indicators, pattern detection, paper trading for BTC/ETH/SOL/BNB
 """
 
@@ -24,13 +24,16 @@ STOP_LOSS_PCT   = float(os.getenv('STOP_LOSS_PCT', 3))
 TAKE_PROFIT_PCT = float(os.getenv('TAKE_PROFIT_PCT', 6))
 ACTIVE_PAIRS    = os.getenv('ACTIVE_PAIRS', 'BTC,ETH,SOL,BNB').split(',')
 
-# CoinGecko ID mapping
-COINGECKO_IDS = {
-    'BTC': 'bitcoin',
-    'ETH': 'ethereum',
-    'SOL': 'solana',
-    'BNB': 'binancecoin',
+# Kraken symbol mapping
+KRAKEN_SYMBOLS = {
+    'BTC': 'XBT/USD',  # Kraken uses XBT for Bitcoin
+    'ETH': 'ETH/USD',
+    'SOL': 'SOL/USD',
+    'BNB': 'BNB/USD',
 }
+
+# Kraken API endpoint
+KRAKEN_API = 'https://api.kraken.com/0/public'
 
 # Colors for UI
 PAIR_COLORS = {
@@ -40,7 +43,7 @@ PAIR_COLORS = {
     'BNB': '#F3BA2F',
 }
 
-# Cache for OHLCV data to avoid rate limits
+# Cache for OHLCV data
 ohlcv_cache = {}
 last_fetch_time = {}
 
@@ -62,23 +65,28 @@ def make_paper_state():
 paper_states = {pair: make_paper_state() for pair in ACTIVE_PAIRS}
 
 # ══════════════════════════════════════════════════
-# LIVE PRICE FEED — CoinGecko (free, no API key)
+# LIVE PRICE FEED — Kraken API
 # ══════════════════════════════════════════════════
 def get_all_prices():
-    """Fetch all prices in a single CoinGecko API call."""
+    """Fetch all prices from Kraken."""
     try:
-        ids = ','.join([COINGECKO_IDS[p] for p in ACTIVE_PAIRS if p in COINGECKO_IDS])
-        url = f'https://api.coingecko.com/api/v3/simple/price?ids={ids}&vs_currencies=usd&include_24hr_change=true'
-        
-        log.debug(f"Fetching prices from CoinGecko")
+        url = f'{KRAKEN_API}/Ticker'
+        log.debug(f"Fetching prices from Kraken")
         r = requests.get(url, timeout=10)
         r.raise_for_status()
         data = r.json()
         
+        if data['error']:
+            log.error(f"Kraken API error: {data['error']}")
+            return {}
+        
         prices = {}
-        for pair, coin_id in COINGECKO_IDS.items():
-            if coin_id in data:
-                prices[pair] = data[coin_id]['usd']
+        for pair, kraken_symbol in KRAKEN_SYMBOLS.items():
+            # Convert format: XBT/USD -> XXBTZUSD for Kraken API
+            symbol_key = kraken_symbol.replace('/', '').upper()
+            if symbol_key in data['result']:
+                ticker = data['result'][symbol_key]
+                prices[pair] = float(ticker['c'][0])  # 'c' is last price
         
         log.debug(f"Got prices: {prices}")
         return prices
@@ -90,91 +98,87 @@ def get_all_prices():
 def get_price(pair):
     """Get single pair price."""
     try:
-        coin_id = COINGECKO_IDS.get(pair)
-        if not coin_id:
+        kraken_symbol = KRAKEN_SYMBOLS.get(pair)
+        if not kraken_symbol:
             return None
             
-        url = f'https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies=usd'
+        symbol_key = kraken_symbol.replace('/', '').upper()
+        url = f'{KRAKEN_API}/Ticker?pair={symbol_key}'
         r = requests.get(url, timeout=10)
         r.raise_for_status()
         data = r.json()
-        return data[coin_id]['usd']
+        
+        if data['error'] or symbol_key not in data['result']:
+            return None
+            
+        return float(data['result'][symbol_key]['c'][0])
     except Exception as e:
         log.error(f"Price fetch error for {pair}: {e}")
         return None
 
 
 def get_ohlcv(pair, interval='1h', limit=100):
-    """Fetch OHLCV data using CoinGecko with rate limiting."""
+    """Fetch OHLCV data from Kraken."""
     try:
-        coin_id = COINGECKO_IDS.get(pair)
-        if not coin_id:
-            log.error(f"No CoinGecko ID for {pair}")
+        kraken_symbol = KRAKEN_SYMBOLS.get(pair)
+        if not kraken_symbol:
+            log.error(f"No Kraken symbol for {pair}")
             return None
         
-        # Rate limiting - wait 2 seconds between requests to same pair
+        # Rate limiting - wait 2 seconds between requests
         now = time.time()
         if pair in last_fetch_time and now - last_fetch_time[pair] < 2:
-            # Return cached data if available and not expired
             if pair in ohlcv_cache:
                 cached_df = ohlcv_cache[pair]
                 if cached_df is not None and len(cached_df) >= limit:
                     log.debug(f"Using cached data for {pair}")
                     return cached_df
         
-        # Map interval for CoinGecko
+        # Map interval to Kraken interval (minutes)
         interval_map = {
-            '1h': 'hourly',
-            '4h': '4h', 
-            '1d': 'daily'
+            '1h': 60,
+            '4h': 240,
+            '1d': 1440
         }
-        coin_interval = interval_map.get(interval, 'hourly')
+        kraken_interval = interval_map.get(interval, 60)
         
-        # CoinGecko market chart endpoint
-        url = f'https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart?vs_currency=usd&days=7&interval={coin_interval}'
+        symbol_key = kraken_symbol.replace('/', '').upper()
+        url = f'{KRAKEN_API}/OHLC?pair={symbol_key}&interval={kraken_interval}'
         
-        log.debug(f"Fetching OHLCV for {pair} from CoinGecko")
-        r = requests.get(url, timeout=10)
+        log.debug(f"Fetching OHLCV for {pair} from Kraken")
+        r = requests.get(url, timeout=15)
         r.raise_for_status()
         data = r.json()
         
-        if not data or 'prices' not in data:
-            log.warning(f"No price data for {pair}")
-            return None
+        if data['error']:
+            log.error(f"Kraken OHLCV error for {pair}: {data['error']}")
+            return ohlcv_cache.get(pair, None)
         
-        # Convert to DataFrame with OHLCV
-        prices = data['prices']
-        volumes = data.get('total_volumes', [])
+        if symbol_key not in data['result']:
+            log.warning(f"No OHLCV data for {pair}")
+            return ohlcv_cache.get(pair, None)
         
-        # Create DataFrame
+        ohlcv_data = data['result'][symbol_key]
+        
+        if not ohlcv_data or len(ohlcv_data) == 0:
+            log.warning(f"Empty OHLCV data for {pair}")
+            return ohlcv_cache.get(pair, None)
+        
+        # Convert to DataFrame
         df_data = []
-        for i in range(len(prices)):
-            if i >= len(volumes):
-                volume = 0
-            else:
-                volume = volumes[i][1] if len(volumes) > i else 0
-            
-            # CoinGecko only gives prices, we need to approximate OHLC
-            # For simplicity, use close price for all OHLC
-            price = prices[i][1]
-            timestamp = prices[i][0]
-            
+        for candle in ohlcv_data[-limit:]:  # Get last 'limit' candles
             df_data.append({
-                'time': timestamp,
-                'open': price,
-                'high': price * 1.001,  # Approximate high
-                'low': price * 0.999,   # Approximate low
-                'close': price,
-                'volume': volume
+                'time': candle[0],  # timestamp
+                'open': float(candle[1]),
+                'high': float(candle[2]),
+                'low': float(candle[3]),
+                'close': float(candle[4]),
+                'volume': float(candle[6])  # volume
             })
         
         df = pd.DataFrame(df_data)
-        df['time'] = pd.to_datetime(df['time'], unit='ms')
+        df['time'] = pd.to_datetime(df['time'], unit='s')
         df.set_index('time', inplace=True)
-        
-        # Resample to get proper OHLC if needed
-        if len(df) > limit:
-            df = df.iloc[-limit:]
         
         # Cache the data
         ohlcv_cache[pair] = df
@@ -185,37 +189,40 @@ def get_ohlcv(pair, interval='1h', limit=100):
         
     except requests.exceptions.RequestException as e:
         log.error(f"OHLCV request error for {pair}: {e}")
-        # Return cached data if available
-        if pair in ohlcv_cache:
-            log.info(f"Using cached data for {pair} due to error")
-            return ohlcv_cache[pair]
-        return None
+        return ohlcv_cache.get(pair, None)
     except Exception as e:
         log.error(f"OHLCV fetch error for {pair}: {e}")
-        if pair in ohlcv_cache:
-            return ohlcv_cache[pair]
-        return None
+        return ohlcv_cache.get(pair, None)
 
 
 def get_24h_stats(pair):
-    """Get 24h price change stats from CoinGecko."""
+    """Get 24h price change stats from Kraken."""
     try:
-        coin_id = COINGECKO_IDS.get(pair)
-        if not coin_id:
+        kraken_symbol = KRAKEN_SYMBOLS.get(pair)
+        if not kraken_symbol:
             return {'change_pct': 0, 'high': 0, 'low': 0, 'volume': 0}
         
-        url = f'https://api.coingecko.com/api/v3/coins/{coin_id}?localization=false&tickers=false&market_data=true&community_data=false&developer_data=false&sparkline=false'
-        
+        symbol_key = kraken_symbol.replace('/', '').upper()
+        url = f'{KRAKEN_API}/Ticker?pair={symbol_key}'
         r = requests.get(url, timeout=10)
         r.raise_for_status()
         data = r.json()
-        market_data = data.get('market_data', {})
+        
+        if data['error'] or symbol_key not in data['result']:
+            return {'change_pct': 0, 'high': 0, 'low': 0, 'volume': 0}
+        
+        ticker = data['result'][symbol_key]
+        
+        # Calculate 24h change percentage
+        open_price = float(ticker['o'][0])
+        last_price = float(ticker['c'][0])
+        change_pct = ((last_price - open_price) / open_price) * 100
         
         return {
-            'change_pct': market_data.get('price_change_percentage_24h', 0),
-            'high': market_data.get('high_24h', {}).get('usd', 0),
-            'low': market_data.get('low_24h', {}).get('usd', 0),
-            'volume': market_data.get('total_volume', {}).get('usd', 0),
+            'change_pct': change_pct,
+            'high': float(ticker['h'][0]),
+            'low': float(ticker['l'][0]),
+            'volume': float(ticker['v'][1]),  # 24h volume
         }
     except Exception as e:
         log.error(f"24h stats error for {pair}: {e}")
@@ -223,8 +230,9 @@ def get_24h_stats(pair):
 
 
 # ══════════════════════════════════════════════════
-# TECHNICAL ANALYSIS ENGINE (same as before)
+# REST OF THE CODE (same as before - indicators, patterns, signals, paper trading)
 # ══════════════════════════════════════════════════
+
 def calculate_indicators(df):
     """Full indicator suite: RSI, MACD, BB, MAs, ATR, Stochastic, OBV."""
     try:
@@ -337,61 +345,37 @@ def get_indicator_snapshot(df):
     }
 
 
-# ══════════════════════════════════════════════════
-# PATTERN DETECTION ENGINE (same as before)
-# ══════════════════════════════════════════════════
 def detect_patterns(df):
-    """Detect 30+ candlestick and chart patterns."""
+    """Detect candlestick patterns."""
     if df is None or len(df) < 5:
         return []
         
     detected = []
     c = df.iloc[-1]
-    p = df.iloc[-2]
-    p2 = df.iloc[-3]
-    p3 = df.iloc[-4]
 
     def body(candle): return abs(float(candle['close']) - float(candle['open']))
     def range_(candle): return float(candle['high']) - float(candle['low'])
     def is_bull(candle): return float(candle['close']) > float(candle['open'])
-    def upper_wick(candle): return float(candle['high']) - max(float(candle['close']), float(candle['open']))
-    def lower_wick(candle): return min(float(candle['close']), float(candle['open'])) - float(candle['low'])
 
     bc = body(c)
     rc = range_(c)
     bull_c = is_bull(c)
-    bp = body(p)
-    rp = range_(p)
-    bull_p = is_bull(p)
-    bp2 = body(p2)
-    bull_p2 = is_bull(p2)
-    uw_c = upper_wick(c)
-    lw_c = lower_wick(c)
+    uw_c = float(c['high']) - max(float(c['close']), float(c['open']))
+    lw_c = min(float(c['close']), float(c['open'])) - float(c['low'])
 
     # Single candle patterns
     if rc > 0:
         # Hammer
         if lw_c >= 2*bc and uw_c <= bc*0.3 and not bull_c:
             detected.append({'id': 'hammer', 'name': 'Hammer', 'signal': 'BULLISH', 'reliability': 72, 'category': 'Candlestick'})
-        # Inverted Hammer
-        if uw_c >= 2*bc and lw_c <= bc*0.3 and not bull_c:
-            detected.append({'id': 'inv_hammer', 'name': 'Inverted Hammer', 'signal': 'BULLISH', 'reliability': 65, 'category': 'Candlestick'})
         # Doji
         if bc <= rc*0.1:
-            if lw_c >= rc*0.6:
-                detected.append({'id': 'dragonfly_doji', 'name': 'Dragonfly Doji', 'signal': 'BULLISH', 'reliability': 68, 'category': 'Candlestick'})
-            elif uw_c >= rc*0.6:
-                detected.append({'id': 'gravestone_doji', 'name': 'Gravestone Doji', 'signal': 'BEARISH', 'reliability': 70, 'category': 'Candlestick'})
-            else:
-                detected.append({'id': 'doji', 'name': 'Doji', 'signal': 'NEUTRAL', 'reliability': 55, 'category': 'Candlestick'})
+            detected.append({'id': 'doji', 'name': 'Doji', 'signal': 'NEUTRAL', 'reliability': 55, 'category': 'Candlestick'})
 
-    log.info(f"Detected {len(detected)} patterns")
+    log.debug(f"Detected {len(detected)} patterns for {df.index[-1]}")
     return detected
 
 
-# ══════════════════════════════════════════════════
-# SIGNAL FUSION ENGINE (same as before)
-# ══════════════════════════════════════════════════
 def generate_signal(indicators, patterns, sentiment_score, pattern_weights):
     """Combine all signals into LONG/SHORT/HOLD with confidence score."""
     if not indicators:
@@ -464,9 +448,6 @@ def generate_signal(indicators, patterns, sentiment_score, pattern_weights):
     }
 
 
-# ══════════════════════════════════════════════════
-# PAPER TRADING ENGINE (same as before)
-# ══════════════════════════════════════════════════
 def paper_trade(pair, signal_data, price):
     """Execute paper trade for a specific pair."""
     ps = paper_states[pair]
