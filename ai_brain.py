@@ -8,15 +8,23 @@ import os
 import json
 import logging
 from datetime import datetime
-from anthropic import Anthropic
 
 log = logging.getLogger(__name__)
 
+# Initialize Anthropic client safely
+client = None
 try:
-    client = Anthropic(api_key=os.getenv('ANTHROPIC_API_KEY',''))
+    from anthropic import Anthropic
+    api_key = os.getenv('ANTHROPIC_API_KEY')
+    if api_key:
+        client = Anthropic(api_key=api_key)
+        log.info("Anthropic client initialized")
+    else:
+        log.warning("ANTHROPIC_API_KEY not set - AI analysis disabled")
+except ImportError as e:
+    log.warning(f"Anthropic library not available: {e}")
 except Exception as e:
     log.warning(f"Anthropic client init failed: {e}")
-    client = None
 
 WEIGHT_FILE = 'pattern_weights.json'
 
@@ -37,16 +45,16 @@ ai_review_count = 0
 def load_weights():
     try:
         if os.path.exists(WEIGHT_FILE):
-            with open(WEIGHT_FILE,'r') as f:
+            with open(WEIGHT_FILE, 'r') as f:
                 return json.load(f)
-    except:
-        pass
+    except Exception as e:
+        log.error(f"Load weights error: {e}")
     return dict(DEFAULT_WEIGHTS)
 
 
 def save_weights(weights):
     try:
-        with open(WEIGHT_FILE,'w') as f:
+        with open(WEIGHT_FILE, 'w') as f:
             json.dump(weights, f, indent=2)
     except Exception as e:
         log.error(f"Save weights error: {e}")
@@ -59,9 +67,18 @@ def analyze_trade(trade, patterns, indicators, sentiment, pair):
     """Send closed trade to Claude for analysis and weight updates."""
     global pattern_weights, brain_memory, ai_review_count
 
+    # Return early if no API key or client
     if not client or not os.getenv('ANTHROPIC_API_KEY'):
-        log.warning("No API key — skipping AI analysis")
-        return None
+        log.debug("No API key — skipping AI analysis")
+        return {
+            'verdict': 'skipped',
+            'explanation': 'No API key configured',
+            'key_lesson': 'Set ANTHROPIC_API_KEY to enable AI analysis',
+            'weight_changes': {},
+            'confidence': 0,
+            'adapt_stop_loss': None,
+            'adapt_take_profit': None
+        }
 
     pat_names = [p['name'] for p in patterns] if patterns else ['No pattern']
     pnl = trade.get('pnl', 0)
@@ -111,19 +128,19 @@ Rules:
         response = client.messages.create(
             model='claude-sonnet-4-20250514',
             max_tokens=600,
-            messages=[{'role':'user','content':prompt}]
+            messages=[{'role': 'user', 'content': prompt}]
         )
         raw = response.content[0].text.strip()
         analysis = json.loads(raw)
 
         changes_applied = {}
         if analysis.get('verdict') != 'external_factor':
-            for pat_id, delta in analysis.get('weight_changes',{}).items():
+            for pat_id, delta in analysis.get('weight_changes', {}).items():
                 if pat_id in pattern_weights:
                     old = pattern_weights[pat_id]
-                    new = max(40, min(95, old+int(delta)))
+                    new = max(40, min(95, old + int(delta)))
                     pattern_weights[pat_id] = new
-                    changes_applied[pat_id] = {'from':old,'to':new,'delta':delta}
+                    changes_applied[pat_id] = {'from': old, 'to': new, 'delta': delta}
             save_weights(pattern_weights)
 
         # Adaptive SL/TP
@@ -131,17 +148,17 @@ Rules:
         adapt_tp = analysis.get('adapt_take_profit')
 
         memory_entry = {
-            'timestamp':      datetime.now().isoformat(),
-            'pair':           pair,
-            'trade':          trade,
-            'patterns':       pat_names,
-            'verdict':        analysis.get('verdict'),
-            'explanation':    analysis.get('explanation'),
-            'key_lesson':     analysis.get('key_lesson'),
+            'timestamp': datetime.now().isoformat(),
+            'pair': pair,
+            'trade': trade,
+            'patterns': pat_names,
+            'verdict': analysis.get('verdict'),
+            'explanation': analysis.get('explanation'),
+            'key_lesson': analysis.get('key_lesson'),
             'weight_changes': changes_applied,
-            'confidence':     analysis.get('confidence',0),
-            'adapt_sl':       adapt_sl,
-            'adapt_tp':       adapt_tp,
+            'confidence': analysis.get('confidence', 0),
+            'adapt_sl': adapt_sl,
+            'adapt_tp': adapt_tp,
         }
         brain_memory.append(memory_entry)
         if len(brain_memory) > 200:
@@ -164,24 +181,24 @@ def get_brain_summary():
     verdicts = [m['verdict'] for m in brain_memory if m.get('verdict')]
     pair_performance = {}
     for m in brain_memory:
-        p = m.get('pair','?')
+        p = m.get('pair', '?')
         if p not in pair_performance:
-            pair_performance[p] = {'wins':0,'losses':0}
-        if m.get('trade',{}).get('outcome') == 'WIN':
+            pair_performance[p] = {'wins': 0, 'losses': 0}
+        if m.get('trade', {}).get('outcome') == 'WIN':
             pair_performance[p]['wins'] += 1
         else:
             pair_performance[p]['losses'] += 1
 
     return {
-        'total_analyses':    total,
-        'ai_reviews':        ai_review_count,
-        'pattern_valid':     verdicts.count('pattern_valid'),
-        'pattern_failed':    verdicts.count('pattern_failed'),
-        'external_factor':   verdicts.count('external_factor'),
-        'current_weights':   dict(pattern_weights),
-        'top_patterns':      sorted(pattern_weights.items(), key=lambda x:x[1], reverse=True)[:8],
-        'recent_memory':     brain_memory[-15:][::-1],
-        'pair_performance':  pair_performance,
+        'total_analyses': total,
+        'ai_reviews': ai_review_count,
+        'pattern_valid': verdicts.count('pattern_valid'),
+        'pattern_failed': verdicts.count('pattern_failed'),
+        'external_factor': verdicts.count('external_factor'),
+        'current_weights': dict(pattern_weights),
+        'top_patterns': sorted(pattern_weights.items(), key=lambda x: x[1], reverse=True)[:8],
+        'recent_memory': brain_memory[-15:][::-1],
+        'pair_performance': pair_performance,
     }
 
 
