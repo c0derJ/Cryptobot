@@ -75,7 +75,7 @@ def get_all_prices():
     log.warning("Using current market prices")
     return {
         'BTC': 68555.78,
-        'ETH': 2054.17,
-        'SOL': 86.14,
-        'BNB': 628.8,
+        'ETH': 3213.17,
+        'SOL': 179.62,
+        'BNB': 616.07,
     }
