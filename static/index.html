@@ -494,7 +494,7 @@ body::after {
       <button class="btn btn-start" id="startBtn" onclick="toggleBot()">▶ START BOT</button>
       <button class="btn btn-stop" onclick="stopBot()">■ STOP</button>
       <button class="btn btn-scan" onclick="triggerScan()">⟳ SCAN NOW</button>
-      <div class="scan-info">NEXT SCAN IN <span id="countdown">60:00</span></div>
+      <div class="scan-info">NEXT SCAN IN <span id="countdown">--:--</span></div>
     </div>
 
     <div class="log-panel">
@@ -888,21 +888,69 @@ function renderRightPanel() {
   }
 }
 
-// ── BOT CONTROLS ──
+// ── BOT CONTROLS (FIXED) ──
 async function toggleBot() {
   const endpoint = botRunning ? '/api/bot/stop' : '/api/bot/start';
-  await fetch(`${API}${endpoint}`, {method:'POST'});
-  await fetchStatus();
+  try {
+    const response = await fetch(`${API}${endpoint}`, {method:'POST'});
+    const data = await response.json();
+    console.log('Bot toggle response:', data);
+    
+    // Toggle the state
+    botRunning = !botRunning;
+    
+    // Update UI immediately
+    updateBotUI(botRunning);
+    
+    // Fetch fresh status to confirm
+    await fetchStatus();
+  } catch (error) {
+    console.error('Error toggling bot:', error);
+    addLog('Failed to toggle bot: ' + error, 'error');
+  }
 }
 
 async function stopBot() {
-  await fetch(`${API}/api/bot/stop`, {method:'POST'});
-  await fetchStatus();
+  try {
+    await fetch(`${API}/api/bot/stop`, {method:'POST'});
+    botRunning = false;
+    updateBotUI(false);
+    await fetchStatus();
+    addLog('Bot manually stopped', 'error');
+  } catch (error) {
+    console.error('Error stopping bot:', error);
+  }
 }
 
 async function triggerScan() {
   addLog('Manual scan triggered...', 'info');
   await fetch(`${API}/api/scan/now`, {method:'POST'});
+}
+
+function updateBotUI(isRunning) {
+  const btn = document.getElementById('startBtn');
+  const badge = document.getElementById('statusBadge');
+  const dot = document.getElementById('liveDot');
+  const scanInfo = document.getElementById('scanInfo');
+  
+  if (isRunning) {
+    btn.textContent = '⏸ PAUSE';
+    btn.classList.add('on');
+    badge.textContent = 'RUNNING';
+    badge.className = 'status-badge running';
+    dot.style.opacity = '1';
+    addLog('Bot started - scanning active', 'success');
+    startCountdown();
+  } else {
+    btn.textContent = '▶ START BOT';
+    btn.classList.remove('on');
+    badge.textContent = 'STANDBY';
+    badge.className = 'status-badge stopped';
+    dot.style.opacity = '0.3';
+    addLog('Bot stopped', 'warning');
+    if (countdownTimer) clearInterval(countdownTimer);
+    document.getElementById('countdown').textContent = '--:--';
+  }
 }
 
 // ── LOG ──
@@ -918,40 +966,35 @@ function addLog(msg, level='info') {
   document.getElementById('logCount').textContent = `${logCount} EVENTS`;
 }
 
-// ── COUNTDOWN ──
+// ── COUNTDOWN (FIXED) ──
 function startCountdown() {
-  countdown = 3600;
   if (countdownTimer) clearInterval(countdownTimer);
   countdownTimer = setInterval(() => {
+    if (!botRunning) return;
+    if (countdown <= 0) {
+      countdown = 3600;
+    }
     countdown--;
-    if (countdown <= 0) countdown = 3600;
     const m = String(Math.floor(countdown/60)).padStart(2,'0');
     const s = String(countdown%60).padStart(2,'0');
     document.getElementById('countdown').textContent = `${m}:${s}`;
   }, 1000);
 }
 
-// ── API CALLS ──
+// ── API CALLS (FIXED) ──
 async function fetchStatus() {
   try {
     const r = await fetch(`${API}/api/status`);
     const d = await r.json();
     botRunning = d.bot_running;
-    const btn  = document.getElementById('startBtn');
-    const badge = document.getElementById('statusBadge');
-    const dot   = document.getElementById('liveDot');
-    if (botRunning) {
-      btn.textContent = '⏸ PAUSE'; btn.classList.add('on');
-      badge.textContent = 'RUNNING'; badge.className = 'status-badge running';
-      dot.style.opacity = '1';
-      startCountdown();
-    } else {
-      btn.textContent = '▶ START BOT'; btn.classList.remove('on');
-      badge.textContent = 'STANDBY'; badge.className = 'status-badge stopped';
-      dot.style.opacity = '0.3';
+    updateBotUI(botRunning);
+    
+    if (d.last_scan) {
+      document.getElementById('scanInfo').textContent = `LAST SCAN: ${new Date(d.last_scan).toLocaleTimeString()}`;
     }
-    if (d.last_scan) document.getElementById('scanInfo').textContent = `LAST SCAN: ${new Date(d.last_scan).toLocaleTimeString()}`;
-  } catch(e) {}
+  } catch(e) {
+    console.error('Error fetching status:', e);
+  }
 }
 
 async function fetchPrices() {
@@ -1019,7 +1062,6 @@ renderPairCards();
 renderRightPanel();
 addLog('CRYPTOBOT initialized — BTC, ETH, SOL, BNB ready', 'sol');
 addLog('Connecting to backend...', 'info');
-startCountdown();
 
 // Initial fetches
 fetchStatus();
