@@ -1,6 +1,6 @@
 """
 CRYPTOBOT - Core Engine
-Live prices via Kraken API (works in Canada, free, no API key needed)
+Live prices via CoinCap API (free, no API key, works globally)
 TA indicators, pattern detection, paper trading for BTC/ETH/SOL/BNB
 """
 
@@ -9,6 +9,7 @@ import time
 import logging
 import requests
 import pandas as pd
+import numpy as np
 import ta
 from datetime import datetime
 from dotenv import load_dotenv
@@ -24,16 +25,13 @@ STOP_LOSS_PCT   = float(os.getenv('STOP_LOSS_PCT', 3))
 TAKE_PROFIT_PCT = float(os.getenv('TAKE_PROFIT_PCT', 6))
 ACTIVE_PAIRS    = os.getenv('ACTIVE_PAIRS', 'BTC,ETH,SOL,BNB').split(',')
 
-# Kraken symbol mapping
-KRAKEN_SYMBOLS = {
-    'BTC': 'XBT/USD',  # Kraken uses XBT for Bitcoin
-    'ETH': 'ETH/USD',
-    'SOL': 'SOL/USD',
-    'BNB': 'BNB/USD',
+# CoinCap asset IDs
+COINCAP_IDS = {
+    'BTC': 'bitcoin',
+    'ETH': 'ethereum',
+    'SOL': 'solana',
+    'BNB': 'binance-coin',
 }
-
-# Kraken API endpoint
-KRAKEN_API = 'https://api.kraken.com/0/public'
 
 # Colors for UI
 PAIR_COLORS = {
@@ -43,9 +41,11 @@ PAIR_COLORS = {
     'BNB': '#F3BA2F',
 }
 
-# Cache for OHLCV data
+# Cache for price data
+price_cache = {}
+last_price_fetch = 0
 ohlcv_cache = {}
-last_fetch_time = {}
+last_ohlcv_fetch = {}
 
 # ── PAPER TRADING STATE (per pair) ──
 def make_paper_state():
@@ -65,124 +65,146 @@ def make_paper_state():
 paper_states = {pair: make_paper_state() for pair in ACTIVE_PAIRS}
 
 # ══════════════════════════════════════════════════
-# LIVE PRICE FEED — Kraken API
+# LIVE PRICE FEED — CoinCap API (works in Canada)
 # ══════════════════════════════════════════════════
 def get_all_prices():
-    """Fetch all prices from Kraken."""
+    """Fetch all prices from CoinCap."""
+    global last_price_fetch, price_cache
+    
+    # Rate limit: don't fetch more than once every 5 seconds
+    now = time.time()
+    if now - last_price_fetch < 5 and price_cache:
+        return price_cache
+    
     try:
-        url = f'{KRAKEN_API}/Ticker'
-        log.debug(f"Fetching prices from Kraken")
-        r = requests.get(url, timeout=10)
+        url = 'https://api.coincap.io/v2/assets'
+        params = {
+            'ids': ','.join([COINCAP_IDS[p] for p in ACTIVE_PAIRS if p in COINCAP_IDS]),
+            'limit': 100
+        }
+        
+        log.debug("Fetching prices from CoinCap")
+        r = requests.get(url, params=params, timeout=10)
         r.raise_for_status()
         data = r.json()
         
-        if data['error']:
-            log.error(f"Kraken API error: {data['error']}")
-            return {}
-        
         prices = {}
-        for pair, kraken_symbol in KRAKEN_SYMBOLS.items():
-            # Convert format: XBT/USD -> XXBTZUSD for Kraken API
-            symbol_key = kraken_symbol.replace('/', '').upper()
-            if symbol_key in data['result']:
-                ticker = data['result'][symbol_key]
-                prices[pair] = float(ticker['c'][0])  # 'c' is last price
+        for asset in data.get('data', []):
+            for pair, asset_id in COINCAP_IDS.items():
+                if asset['id'] == asset_id:
+                    prices[pair] = float(asset['priceUsd'])
         
-        log.debug(f"Got prices: {prices}")
+        if prices:
+            price_cache = prices
+            last_price_fetch = now
+            log.debug(f"Got prices: {prices}")
+        
         return prices
     except Exception as e:
         log.error(f"Price fetch error: {e}")
-        return {}
+        return price_cache if price_cache else {}
 
 
 def get_price(pair):
     """Get single pair price."""
     try:
-        kraken_symbol = KRAKEN_SYMBOLS.get(pair)
-        if not kraken_symbol:
+        asset_id = COINCAP_IDS.get(pair)
+        if not asset_id:
             return None
             
-        symbol_key = kraken_symbol.replace('/', '').upper()
-        url = f'{KRAKEN_API}/Ticker?pair={symbol_key}'
+        url = f'https://api.coincap.io/v2/assets/{asset_id}'
         r = requests.get(url, timeout=10)
         r.raise_for_status()
         data = r.json()
         
-        if data['error'] or symbol_key not in data['result']:
-            return None
-            
-        return float(data['result'][symbol_key]['c'][0])
+        return float(data['data']['priceUsd'])
     except Exception as e:
         log.error(f"Price fetch error for {pair}: {e}")
         return None
 
 
 def get_ohlcv(pair, interval='1h', limit=100):
-    """Fetch OHLCV data from Kraken."""
+    """Fetch OHLCV data using CoinCap's history endpoint."""
     try:
-        kraken_symbol = KRAKEN_SYMBOLS.get(pair)
-        if not kraken_symbol:
-            log.error(f"No Kraken symbol for {pair}")
+        asset_id = COINCAP_IDS.get(pair)
+        if not asset_id:
+            log.error(f"No CoinCap ID for {pair}")
             return None
         
-        # Rate limiting - wait 2 seconds between requests
+        # Rate limiting - wait 3 seconds between requests to same pair
         now = time.time()
-        if pair in last_fetch_time and now - last_fetch_time[pair] < 2:
+        if pair in last_ohlcv_fetch and now - last_ohlcv_fetch[pair] < 3:
             if pair in ohlcv_cache:
                 cached_df = ohlcv_cache[pair]
                 if cached_df is not None and len(cached_df) >= limit:
                     log.debug(f"Using cached data for {pair}")
                     return cached_df
         
-        # Map interval to Kraken interval (minutes)
+        # Map interval to CoinCap interval
         interval_map = {
-            '1h': 60,
-            '4h': 240,
-            '1d': 1440
+            '1h': 'h1',
+            '4h': 'h4', 
+            '1d': 'd1'
         }
-        kraken_interval = interval_map.get(interval, 60)
+        coin_interval = interval_map.get(interval, 'h1')
         
-        symbol_key = kraken_symbol.replace('/', '').upper()
-        url = f'{KRAKEN_API}/OHLC?pair={symbol_key}&interval={kraken_interval}'
+        # CoinCap historical data endpoint
+        url = f'https://api.coincap.io/v2/assets/{asset_id}/history'
+        params = {
+            'interval': coin_interval,
+            'limit': limit
+        }
         
-        log.debug(f"Fetching OHLCV for {pair} from Kraken")
-        r = requests.get(url, timeout=15)
+        log.debug(f"Fetching OHLCV for {pair} from CoinCap")
+        r = requests.get(url, params=params, timeout=15)
         r.raise_for_status()
         data = r.json()
         
-        if data['error']:
-            log.error(f"Kraken OHLCV error for {pair}: {data['error']}")
-            return ohlcv_cache.get(pair, None)
-        
-        if symbol_key not in data['result']:
+        if not data or 'data' not in data or not data['data']:
             log.warning(f"No OHLCV data for {pair}")
             return ohlcv_cache.get(pair, None)
         
-        ohlcv_data = data['result'][symbol_key]
+        # CoinCap only gives price and time, we need to generate OHLC
+        # Use the price as close, approximate open/high/low based on price movement
+        history = data['data']
         
-        if not ohlcv_data or len(ohlcv_data) == 0:
-            log.warning(f"Empty OHLCV data for {pair}")
-            return ohlcv_cache.get(pair, None)
-        
-        # Convert to DataFrame
         df_data = []
-        for candle in ohlcv_data[-limit:]:  # Get last 'limit' candles
+        for i, entry in enumerate(history[-limit:]):
+            price = float(entry['priceUsd'])
+            timestamp = entry['time']
+            
+            # Approximate OHLC based on price and previous price
+            if i > 0:
+                prev_price = float(history[-limit + i - 1]['priceUsd'])
+                if price > prev_price:
+                    open_price = prev_price
+                    high_price = price * 1.002
+                    low_price = prev_price * 0.998
+                else:
+                    open_price = prev_price
+                    high_price = prev_price * 1.002
+                    low_price = price * 0.998
+            else:
+                open_price = price
+                high_price = price * 1.001
+                low_price = price * 0.999
+            
             df_data.append({
-                'time': candle[0],  # timestamp
-                'open': float(candle[1]),
-                'high': float(candle[2]),
-                'low': float(candle[3]),
-                'close': float(candle[4]),
-                'volume': float(candle[6])  # volume
+                'time': timestamp,
+                'open': open_price,
+                'high': high_price,
+                'low': low_price,
+                'close': price,
+                'volume': 0  # Volume not available in free tier
             })
         
         df = pd.DataFrame(df_data)
-        df['time'] = pd.to_datetime(df['time'], unit='s')
+        df['time'] = pd.to_datetime(df['time'])
         df.set_index('time', inplace=True)
         
         # Cache the data
         ohlcv_cache[pair] = df
-        last_fetch_time[pair] = now
+        last_ohlcv_fetch[pair] = now
         
         log.info(f"Fetched {len(df)} candles for {pair}")
         return df[['open', 'high', 'low', 'close', 'volume']]
@@ -196,33 +218,23 @@ def get_ohlcv(pair, interval='1h', limit=100):
 
 
 def get_24h_stats(pair):
-    """Get 24h price change stats from Kraken."""
+    """Get 24h price change stats from CoinCap."""
     try:
-        kraken_symbol = KRAKEN_SYMBOLS.get(pair)
-        if not kraken_symbol:
+        asset_id = COINCAP_IDS.get(pair)
+        if not asset_id:
             return {'change_pct': 0, 'high': 0, 'low': 0, 'volume': 0}
         
-        symbol_key = kraken_symbol.replace('/', '').upper()
-        url = f'{KRAKEN_API}/Ticker?pair={symbol_key}'
+        url = f'https://api.coincap.io/v2/assets/{asset_id}'
         r = requests.get(url, timeout=10)
         r.raise_for_status()
         data = r.json()
-        
-        if data['error'] or symbol_key not in data['result']:
-            return {'change_pct': 0, 'high': 0, 'low': 0, 'volume': 0}
-        
-        ticker = data['result'][symbol_key]
-        
-        # Calculate 24h change percentage
-        open_price = float(ticker['o'][0])
-        last_price = float(ticker['c'][0])
-        change_pct = ((last_price - open_price) / open_price) * 100
+        asset_data = data['data']
         
         return {
-            'change_pct': change_pct,
-            'high': float(ticker['h'][0]),
-            'low': float(ticker['l'][0]),
-            'volume': float(ticker['v'][1]),  # 24h volume
+            'change_pct': float(asset_data.get('changePercent24Hr', 0)),
+            'high': float(asset_data.get('maxPrice', 0)),
+            'low': float(asset_data.get('minPrice', 0)),
+            'volume': float(asset_data.get('volumeUsd24Hr', 0)),
         }
     except Exception as e:
         log.error(f"24h stats error for {pair}: {e}")
@@ -230,9 +242,8 @@ def get_24h_stats(pair):
 
 
 # ══════════════════════════════════════════════════
-# REST OF THE CODE (same as before - indicators, patterns, signals, paper trading)
+# TECHNICAL ANALYSIS ENGINE
 # ══════════════════════════════════════════════════
-
 def calculate_indicators(df):
     """Full indicator suite: RSI, MACD, BB, MAs, ATR, Stochastic, OBV."""
     try:
@@ -372,7 +383,7 @@ def detect_patterns(df):
         if bc <= rc*0.1:
             detected.append({'id': 'doji', 'name': 'Doji', 'signal': 'NEUTRAL', 'reliability': 55, 'category': 'Candlestick'})
 
-    log.debug(f"Detected {len(detected)} patterns for {df.index[-1]}")
+    log.debug(f"Detected {len(detected)} patterns")
     return detected
 
 
