@@ -1,78 +1,69 @@
 def get_all_prices():
-    """Fetch real-time prices from Binance public API."""
+    """Fetch real-time prices from CoinGecko (reliable for all coins)."""
     global last_price_fetch, price_cache
     
     now = time.time()
     
-    # Return cached prices if fetched recently (within 5 seconds)
-    if price_cache and now - last_price_fetch < 5:
+    if price_cache and now - last_price_fetch < 10:
         return price_cache
     
     try:
-        # Fetch prices for each pair individually (more reliable)
-        prices = {}
-        
-        # BTC
-        btc_resp = requests.get('https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT', timeout=5)
-        if btc_resp.status_code == 200:
-            prices['BTC'] = float(btc_resp.json()['price'])
-        
-        # ETH
-        eth_resp = requests.get('https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT', timeout=5)
-        if eth_resp.status_code == 200:
-            prices['ETH'] = float(eth_resp.json()['price'])
-        
-        # SOL
-        sol_resp = requests.get('https://api.binance.com/api/v3/ticker/price?symbol=SOLUSDT', timeout=5)
-        if sol_resp.status_code == 200:
-            prices['SOL'] = float(sol_resp.json()['price'])
-        
-        # BNB
-        bnb_resp = requests.get('https://api.binance.com/api/v3/ticker/price?symbol=BNBUSDT', timeout=5)
-        if bnb_resp.status_code == 200:
-            prices['BNB'] = float(bnb_resp.json()['price'])
-        
-        if len(prices) == 4:
-            log.info(f"💰 BINANCE PRICES: BTC=${prices['BTC']:,.2f} | ETH=${prices['ETH']:,.2f} | SOL=${prices['SOL']:,.2f} | BNB=${prices['BNB']:,.2f}")
-            price_cache = prices
-            last_price_fetch = now
-            return prices
-        else:
-            log.warning(f"Only got {len(prices)} prices: {prices}")
-            
-    except Exception as e:
-        log.error(f"Binance price fetch error: {e}")
-    
-    # Fallback to CoinGecko with actual market prices
-    try:
+        # CoinGecko API - free, no key needed, works in Canada
         url = 'https://api.coingecko.com/api/v3/simple/price'
         params = {
             'ids': 'bitcoin,ethereum,solana,binancecoin',
-            'vs_currencies': 'usd'
+            'vs_currencies': 'usd',
+            'include_24hr_change': 'true'
         }
+        
+        log.debug("Fetching prices from CoinGecko...")
         r = requests.get(url, params=params, timeout=10)
+        r.raise_for_status()
         data = r.json()
         
         prices = {}
         if 'bitcoin' in data:
-            prices['BTC'] = data['bitcoin']['usd']
+            prices['BTC'] = round(data['bitcoin']['usd'], 2)
         if 'ethereum' in data:
-            prices['ETH'] = data['ethereum']['usd']
+            prices['ETH'] = round(data['ethereum']['usd'], 2)
         if 'solana' in data:
-            prices['SOL'] = data['solana']['usd']
+            prices['SOL'] = round(data['solana']['usd'], 2)
         if 'binancecoin' in data:
-            prices['BNB'] = data['binancecoin']['usd']
+            prices['BNB'] = round(data['binancecoin']['usd'], 2)
         
         if len(prices) == 4:
-            log.info(f"💰 COINGECKO PRICES: BTC=${prices['BTC']:,.2f} | ETH=${prices['ETH']:,.2f} | SOL=${prices['SOL']:,.2f} | BNB=${prices['BNB']:,.2f}")
+            log.info(f"💰 CoinGecko: BTC=${prices['BTC']:,.2f} | ETH=${prices['ETH']:,.2f} | SOL=${prices['SOL']:,.2f} | BNB=${prices['BNB']:,.2f}")
             price_cache = prices
             last_price_fetch = now
             return prices
+            
     except Exception as e:
-        log.error(f"CoinGecko fallback error: {e}")
+        log.error(f"CoinGecko price fetch error: {e}")
     
-    # Last resort: current actual market prices (as of March 2025)
-    log.warning("Using current market prices")
+    # Fallback to Binance
+    return fetch_from_binance()
+
+
+def fetch_from_binance():
+    """Fallback to Binance API."""
+    try:
+        prices = {}
+        symbols = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT']
+        
+        for symbol in symbols:
+            url = f'https://api.binance.com/api/v3/ticker/price?symbol={symbol}'
+            r = requests.get(url, timeout=5)
+            if r.status_code == 200:
+                pair = symbol.replace('USDT', '')
+                prices[pair] = float(r.json()['price'])
+        
+        if prices:
+            log.info(f"💰 Binance fallback: BTC=${prices.get('BTC', 0):,.2f} | ETH=${prices.get('ETH', 0):,.2f}")
+            return prices
+    except Exception as e:
+        log.error(f"Binance fallback error: {e}")
+    
+    # Current actual market prices (March 2025)
     return {
         'BTC': 68555.78,
         'ETH': 3213.17,
