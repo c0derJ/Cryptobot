@@ -241,16 +241,11 @@ def initialize():
     except Exception as e:
         log.error(f'Scheduler error: {e}')
 
-    # Auto-start bot
-    bot_running = True
+# Don't auto-start - wait for user to click START
+bot_running = False
 
-    # First scan after 45 seconds
-    def delayed_scan():
-        time.sleep(45)
-        add_log('CRYPTOBOT online — BTC ETH SOL BNB | Paper Mode ON', 'sol')
-        run_all_scans()
-
-    threading.Thread(target=delayed_scan, daemon=True).start()
+# Just log that system is ready
+add_log('CRYPTOBOT ready — Press START to begin', 'sol')
     log.info('CRYPTOBOT initialized successfully')
 
 
