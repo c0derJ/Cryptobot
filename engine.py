@@ -24,12 +24,12 @@ STOP_LOSS_PCT   = float(os.getenv('STOP_LOSS_PCT', 3))
 TAKE_PROFIT_PCT = float(os.getenv('TAKE_PROFIT_PCT', 6))
 ACTIVE_PAIRS    = os.getenv('ACTIVE_PAIRS', 'BTC,ETH,SOL,BNB').split(',')
 
-# Binance symbols map
-BINANCE_SYMBOLS = {
-    'BTC': 'BTCUSDT',
-    'ETH': 'ETHUSDT',
-    'SOL': 'SOLUSDT',
-    'BNB': 'BNBUSDT',
+# CoinGecko IDs
+COIN_IDS = {
+    'BTC': 'bitcoin',
+    'ETH': 'ethereum',
+    'SOL': 'solana',
+    'BNB': 'binancecoin',
 }
 
 # Colors for UI
@@ -58,21 +58,21 @@ def make_paper_state():
 paper_states = {pair: make_paper_state() for pair in ACTIVE_PAIRS}
 
 # ══════════════════════════════════════════════════
-# LIVE PRICE FEED — Binance (fastest free API)
+# LIVE PRICE FEED — CoinGecko (free, no geo-blocks)
 # ══════════════════════════════════════════════════
 def get_all_prices():
-    """Fetch all 4 prices in a single Binance API call."""
+    """Fetch all 4 prices from CoinGecko."""
     try:
-        symbols = [BINANCE_SYMBOLS[p] for p in ACTIVE_PAIRS if p in BINANCE_SYMBOLS]
-        url = 'https://api.binance.com/api/v3/ticker/price'
-        r = requests.get(url, timeout=5)
+        ids = ','.join(COIN_IDS.values())
+        url = f'https://api.coingecko.com/api/v3/simple/price?ids={ids}&vs_currencies=usd'
+        r = requests.get(url, timeout=10)
         data = r.json()
-        prices = {}
-        for item in data:
-            for pair, sym in BINANCE_SYMBOLS.items():
-                if item['symbol'] == sym:
-                    prices[pair] = float(item['price'])
-        return prices
+        return {
+            'BTC': float(data.get('bitcoin',{}).get('usd', 0)),
+            'ETH': float(data.get('ethereum',{}).get('usd', 0)),
+            'SOL': float(data.get('solana',{}).get('usd', 0)),
+            'BNB': float(data.get('binancecoin',{}).get('usd', 0)),
+        }
     except Exception as e:
         log.error(f"Price fetch error: {e}")
         return {}
@@ -80,50 +80,60 @@ def get_all_prices():
 
 def get_price(pair):
     """Get single pair price."""
-    try:
-        sym = BINANCE_SYMBOLS.get(pair, 'BTCUSDT')
-        r = requests.get(f'https://api.binance.com/api/v3/ticker/price?symbol={sym}', timeout=5)
-        return float(r.json()['price'])
-    except:
-        return None
+    prices = get_all_prices()
+    return prices.get(pair, 0)
 
 
 def get_ohlcv(pair, interval='1h', limit=100):
-    """Fetch OHLCV candles from Binance (fastest free source)."""
+    """Fetch OHLCV from CoinGecko market chart."""
     try:
-        sym = BINANCE_SYMBOLS.get(pair, 'BTCUSDT')
-        url = f'https://api.binance.com/api/v3/klines?symbol={sym}&interval={interval}&limit={limit}'
-        r = requests.get(url, timeout=10)
-        raw = r.json()
-        df = pd.DataFrame(raw, columns=[
-            'time','open','high','low','close','volume',
-            'close_time','quote_vol','trades','taker_buy_base',
-            'taker_buy_quote','ignore'
-        ])
-        for col in ['open','high','low','close','volume']:
-            df[col] = df[col].astype(float)
-        df['time'] = pd.to_datetime(df['time'], unit='ms')
-        df.set_index('time', inplace=True)
-        return df[['open','high','low','close','volume']]
+        coin_id = COIN_IDS.get(pair, 'bitcoin')
+        url = f'https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart?vs_currency=usd&days=5&interval=hourly'
+        r = requests.get(url, timeout=15)
+        data = r.json()
+        prices = data.get('prices', [])
+        volumes = data.get('total_volumes', [])
+        if len(prices) < 60:
+            log.error(f"Not enough price data for {pair}: {len(prices)} points")
+            return None
+        rows = []
+        for i in range(1, len(prices)):
+            c   = float(prices[i][1])
+            p   = float(prices[i-1][1])
+            vol = float(volumes[i][1]) if i < len(volumes) else 0
+            rows.append({
+                'time':   pd.Timestamp(prices[i][0], unit='ms'),
+                'open':   p,
+                'high':   max(c, p) * 1.002,
+                'low':    min(c, p) * 0.998,
+                'close':  c,
+                'volume': vol,
+            })
+        df = pd.DataFrame(rows).set_index('time')
+        return df.tail(limit)
     except Exception as e:
         log.error(f"OHLCV fetch error for {pair}: {e}")
         return None
 
 
 def get_24h_stats(pair):
-    """Get 24h price change stats."""
+    """Get 24h stats from CoinGecko."""
     try:
-        sym = BINANCE_SYMBOLS.get(pair, 'BTCUSDT')
-        r = requests.get(f'https://api.binance.com/api/v3/ticker/24hr?symbol={sym}', timeout=5)
-        d = r.json()
-        return {
-            'change_pct': float(d['priceChangePercent']),
-            'high':       float(d['highPrice']),
-            'low':        float(d['lowPrice']),
-            'volume':     float(d['volume']),
-        }
-    except:
-        return {'change_pct': 0, 'high': 0, 'low': 0, 'volume': 0}
+        coin_id = COIN_IDS.get(pair, 'bitcoin')
+        url = f'https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&ids={coin_id}'
+        r = requests.get(url, timeout=10)
+        data = r.json()
+        if data and len(data) > 0:
+            d = data[0]
+            return {
+                'change_pct': d.get('price_change_percentage_24h', 0) or 0,
+                'high':       d.get('high_24h', 0) or 0,
+                'low':        d.get('low_24h', 0) or 0,
+                'volume':     d.get('total_volume', 0) or 0,
+            }
+    except Exception as e:
+        log.error(f"Stats error {pair}: {e}")
+    return {'change_pct': 0, 'high': 0, 'low': 0, 'volume': 0}
 
 
 # ══════════════════════════════════════════════════
