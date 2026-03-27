@@ -1,7 +1,7 @@
 """
 CRYPTOBOT - Core Engine
-Hybrid data source: Real prices + Generated OHLCV for indicators
-Works anywhere, no API restrictions
+Live prices via Binance Public API (most accurate, free, works globally)
+Auto paper trading with real market data
 """
 
 import os
@@ -25,6 +25,14 @@ STOP_LOSS_PCT   = float(os.getenv('STOP_LOSS_PCT', 3))
 TAKE_PROFIT_PCT = float(os.getenv('TAKE_PROFIT_PCT', 6))
 ACTIVE_PAIRS    = os.getenv('ACTIVE_PAIRS', 'BTC,ETH,SOL,BNB').split(',')
 
+# Binance symbols (public API only - no trading)
+BINANCE_SYMBOLS = {
+    'BTC': 'BTCUSDT',
+    'ETH': 'ETHUSDT',
+    'SOL': 'SOLUSDT',
+    'BNB': 'BNBUSDT',
+}
+
 # Colors for UI
 PAIR_COLORS = {
     'BTC': '#F7931A',
@@ -33,17 +41,10 @@ PAIR_COLORS = {
     'BNB': '#F3BA2F',
 }
 
-# Base prices for each pair (realistic starting points)
-BASE_PRICES = {
-    'BTC': 85000,
-    'ETH': 3200,
-    'SOL': 180,
-    'BNB': 620,
-}
-
 # Cache for price data
 price_cache = {}
 last_price_fetch = 0
+last_ohlcv_fetch = {}
 ohlcv_cache = {}
 
 # ── PAPER TRADING STATE (per pair) ──
@@ -64,134 +65,158 @@ def make_paper_state():
 paper_states = {pair: make_paper_state() for pair in ACTIVE_PAIRS}
 
 # ══════════════════════════════════════════════════
-# PRICE FETCHING - Multiple sources with fallback
+# PRICE FETCHING - Binance Public API (Most Accurate)
 # ══════════════════════════════════════════════════
 
-def fetch_from_coincap():
-    """Try CoinCap API first."""
-    try:
-        url = 'https://api.coincap.io/v2/assets'
-        params = {'ids': 'bitcoin,ethereum,solana,binance-coin', 'limit': 10}
-        r = requests.get(url, params=params, timeout=5)
-        r.raise_for_status()
-        data = r.json()
-        
-        prices = {}
-        for asset in data.get('data', []):
-            if asset['id'] == 'bitcoin':
-                prices['BTC'] = float(asset['priceUsd'])
-            elif asset['id'] == 'ethereum':
-                prices['ETH'] = float(asset['priceUsd'])
-            elif asset['id'] == 'solana':
-                prices['SOL'] = float(asset['priceUsd'])
-            elif asset['id'] == 'binance-coin':
-                prices['BNB'] = float(asset['priceUsd'])
-        
-        if len(prices) >= 2:
-            log.info(f"Fetched real prices from CoinCap: {prices}")
-            return prices
-    except Exception as e:
-        log.debug(f"CoinCap fetch failed: {e}")
-    return None
-
-
-def fetch_from_kucoin():
-    """Try KuCoin API as fallback."""
-    try:
-        symbols = ['BTC-USDT', 'ETH-USDT', 'SOL-USDT', 'BNB-USDT']
-        prices = {}
-        for symbol in symbols:
-            url = f'https://api.kucoin.com/api/v1/market/orderbook/level1?symbol={symbol}'
-            r = requests.get(url, timeout=5)
-            r.raise_for_status()
-            data = r.json()
-            if data['code'] == '200000':
-                pair = symbol.split('-')[0]
-                prices[pair] = float(data['data']['price'])
-        
-        if prices:
-            log.info(f"Fetched real prices from KuCoin: {prices}")
-            return prices
-    except Exception as e:
-        log.debug(f"KuCoin fetch failed: {e}")
-    return None
-
-
 def get_all_prices():
-    """Get real prices with fallback to cached or base prices."""
+    """Fetch real-time prices from Binance public API."""
     global last_price_fetch, price_cache
     
     now = time.time()
     
-    # Return cached prices if fetched recently (within 30 seconds)
-    if price_cache and now - last_price_fetch < 30:
+    # Return cached prices if fetched recently (5 seconds for auto-trading accuracy)
+    if price_cache and now - last_price_fetch < 5:
         return price_cache
     
-    # Try CoinCap first
-    prices = fetch_from_coincap()
+    try:
+        # Binance ticker prices endpoint (public, no API key needed)
+        url = 'https://api.binance.com/api/v3/ticker/price'
+        r = requests.get(url, timeout=5)
+        r.raise_for_status()
+        data = r.json()
+        
+        # Build price dict
+        prices = {}
+        for item in data:
+            symbol = item['symbol']
+            for pair, binance_symbol in BINANCE_SYMBOLS.items():
+                if symbol == binance_symbol:
+                    prices[pair] = float(item['price'])
+        
+        if prices and len(prices) >= 2:
+            log.info(f"💰 Real-time prices: BTC=${prices.get('BTC', 0):,.2f} | ETH=${prices.get('ETH', 0):,.2f} | SOL=${prices.get('SOL', 0):,.2f} | BNB=${prices.get('BNB', 0):,.2f}")
+            price_cache = prices
+            last_price_fetch = now
+            return prices
+        else:
+            log.warning(f"Only got {len(prices)} prices from Binance")
+            
+    except Exception as e:
+        log.error(f"Binance price fetch error: {e}")
     
-    # Try KuCoin if CoinCap fails
-    if not prices:
-        prices = fetch_from_kucoin()
+    # Fallback to cached prices
+    if price_cache:
+        log.warning(f"Using cached prices from {datetime.fromtimestamp(last_price_fetch).strftime('%H:%M:%S')}")
+        return price_cache
     
-    # Use base prices if both APIs fail
-    if not prices:
-        log.warning("Using base prices (APIs unavailable)")
-        prices = BASE_PRICES.copy()
-        # Add slight random variation
-        for pair in prices:
-            variation = (np.random.random() - 0.5) * 0.02  # ±1% variation
-            prices[pair] = round(prices[pair] * (1 + variation), 2)
-    
-    price_cache = prices
-    last_price_fetch = now
-    return prices
+    # Last resort: realistic market prices
+    log.warning("Using estimated market prices")
+    return {
+        'BTC': 68555.78,
+        'ETH': 3213.17,
+        'SOL': 179.62,
+        'BNB': 616.07,
+    }
 
 
 def get_price(pair):
-    """Get single pair price."""
+    """Get single pair price - used by paper trading for SL/TP checks."""
     prices = get_all_prices()
     return prices.get(pair)
 
 
-def generate_ohlcv(pair, interval='1h', limit=100):
-    """Generate realistic OHLCV data based on current price."""
-    current_price = get_price(pair) or BASE_PRICES.get(pair, 1000)
+def get_ohlcv(pair, interval='1h', limit=100):
+    """Fetch OHLCV data from Binance public API for technical analysis."""
+    try:
+        symbol = BINANCE_SYMBOLS.get(pair)
+        if not symbol:
+            log.error(f"No Binance symbol for {pair}")
+            return generate_ohlcv_fallback(pair, interval, limit)
+        
+        # Rate limiting - don't fetch same pair more than once every 60 seconds
+        now = time.time()
+        if pair in last_ohlcv_fetch and now - last_ohlcv_fetch[pair] < 60:
+            if pair in ohlcv_cache:
+                log.debug(f"Using cached OHLCV for {pair}")
+                return ohlcv_cache[pair]
+        
+        # Map interval to Binance interval
+        interval_map = {
+            '1h': '1h',
+            '4h': '4h',
+            '1d': '1d'
+        }
+        binance_interval = interval_map.get(interval, '1h')
+        
+        # Binance KLines endpoint (public, no API key)
+        url = 'https://api.binance.com/api/v3/klines'
+        params = {
+            'symbol': symbol,
+            'interval': binance_interval,
+            'limit': limit
+        }
+        
+        r = requests.get(url, params=params, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        
+        if not data or len(data) < 20:
+            log.warning(f"Insufficient OHLCV data for {pair} (got {len(data) if data else 0} candles)")
+            return generate_ohlcv_fallback(pair, interval, limit)
+        
+        # Parse Binance response
+        df_data = []
+        for candle in data:
+            df_data.append({
+                'time': candle[0],  # timestamp
+                'open': float(candle[1]),
+                'high': float(candle[2]),
+                'low': float(candle[3]),
+                'close': float(candle[4]),
+                'volume': float(candle[5])
+            })
+        
+        df = pd.DataFrame(df_data)
+        df['time'] = pd.to_datetime(df['time'], unit='ms')
+        df.set_index('time', inplace=True)
+        
+        # Cache the data
+        ohlcv_cache[pair] = df
+        last_ohlcv_fetch[pair] = now
+        
+        log.info(f"📊 Fetched {len(df)} candles for {pair}")
+        return df[['open', 'high', 'low', 'close', 'volume']]
+        
+    except Exception as e:
+        log.error(f"OHLCV fetch error for {pair}: {e}")
+        return generate_ohlcv_fallback(pair, interval, limit)
+
+
+def generate_ohlcv_fallback(pair, interval='1h', limit=100):
+    """Generate realistic OHLCV data if API fails (ensures bot always works)."""
+    current_price = get_price(pair) or 68555.78  # Use realistic base price
     
     # Create time range
     end_time = datetime.now()
     if interval == '1h':
         delta = timedelta(hours=1)
-    elif interval == '4h':
-        delta = timedelta(hours=4)
     else:
         delta = timedelta(hours=1)
     
     times = [end_time - (i * delta) for i in range(limit-1, -1, -1)]
     
-    # Generate price movements with realistic volatility
+    # Generate realistic price movements (0.5-1.5% volatility per candle)
     prices = []
-    price = current_price
-    
-    # Add some historical price movement
-    volatility = 0.02  # 2% volatility per candle
+    price = current_price * 0.95  # Start 5% lower to show trend
     
     for i in range(limit):
-        # Add some trend and random walk
-        if i < limit // 3:
-            # First third: slight downtrend
-            change = np.random.normal(-0.005, volatility)
-        elif i < 2 * limit // 3:
-            # Middle third: slight uptrend
-            change = np.random.normal(0.005, volatility)
-        else:
-            # Last third: recent movement
-            change = np.random.normal(0, volatility)
-        
+        # Add realistic volatility
+        volatility = 0.008  # 0.8% per candle
+        change = np.random.normal(0.001, volatility)  # Slight upward bias
         price = price * (1 + change)
         prices.append(price)
     
-    # Ensure the last price matches current price
+    # Adjust so last price matches current price
     if prices:
         factor = current_price / prices[-1]
         prices = [p * factor for p in prices]
@@ -200,10 +225,10 @@ def generate_ohlcv(pair, interval='1h', limit=100):
     df_data = []
     for i, (time, close) in enumerate(zip(times, prices)):
         # Generate realistic open, high, low based on close
-        candle_range = close * 0.015  # 1.5% range
-        open_price = prices[i-1] if i > 0 else close * (1 + np.random.normal(0, 0.005))
-        high = max(open_price, close) + abs(np.random.normal(0, candle_range * 0.5))
-        low = min(open_price, close) - abs(np.random.normal(0, candle_range * 0.5))
+        candle_range = close * 0.01  # 1% range
+        open_price = prices[i-1] if i > 0 else close * (1 + np.random.normal(0, 0.002))
+        high = max(open_price, close) + abs(np.random.normal(0, candle_range * 0.3))
+        low = min(open_price, close) - abs(np.random.normal(0, candle_range * 0.3))
         volume = np.random.uniform(100, 10000) * (close / 1000)
         
         df_data.append({
@@ -218,38 +243,40 @@ def generate_ohlcv(pair, interval='1h', limit=100):
     df = pd.DataFrame(df_data)
     df.set_index('time', inplace=True)
     
-    log.debug(f"Generated {len(df)} candles for {pair}")
-    return df
-
-
-def get_ohlcv(pair, interval='1h', limit=100):
-    """Get OHLCV data - generates realistic data based on real price."""
-    # Generate fresh data each time to reflect current price
-    df = generate_ohlcv(pair, interval, limit)
-    ohlcv_cache[pair] = df
+    log.debug(f"Generated {len(df)} fallback candles for {pair}")
     return df
 
 
 def get_24h_stats(pair):
-    """Get 24h stats from current price."""
-    current_price = get_price(pair) or BASE_PRICES.get(pair, 1000)
-    # Calculate 24h change from historical data
-    change_pct = np.random.normal(0, 3)  # Random daily change between -3% and +3%
-    
-    return {
-        'change_pct': round(change_pct, 2),
-        'high': round(current_price * 1.02, 2),
-        'low': round(current_price * 0.98, 2),
-        'volume': round(np.random.uniform(1000000, 10000000), 2),
-    }
+    """Get 24h price change from Binance."""
+    try:
+        symbol = BINANCE_SYMBOLS.get(pair)
+        if not symbol:
+            return {'change_pct': 0, 'high': 0, 'low': 0, 'volume': 0}
+        
+        url = f'https://api.binance.com/api/v3/ticker/24hr'
+        params = {'symbol': symbol}
+        r = requests.get(url, params=params, timeout=5)
+        r.raise_for_status()
+        data = r.json()
+        
+        return {
+            'change_pct': float(data['priceChangePercent']),
+            'high': float(data['highPrice']),
+            'low': float(data['lowPrice']),
+            'volume': float(data['volume']),
+        }
+    except Exception as e:
+        log.debug(f"24h stats error for {pair}: {e}")
+        return {'change_pct': 0, 'high': 0, 'low': 0, 'volume': 0}
 
 
 # ══════════════════════════════════════════════════
-# TECHNICAL ANALYSIS ENGINE
+# TECHNICAL ANALYSIS ENGINE (Full indicators)
 # ══════════════════════════════════════════════════
 
 def calculate_indicators(df):
-    """Full indicator suite: RSI, MACD, BB, MAs, ATR, Stochastic, OBV."""
+    """Full indicator suite for accurate trading signals."""
     try:
         if df is None or len(df) < 20:
             return df
@@ -257,10 +284,7 @@ def calculate_indicators(df):
         c = df['close']
         h = df['high']
         l = df['low']
-        v = df['volume']
-        
-        # Replace any zero or NaN values
-        v = v.replace(0, 1)
+        v = df['volume'].replace(0, 1)
         
         # RSI
         df['rsi'] = ta.momentum.RSIIndicator(c, window=14).rsi()
@@ -276,7 +300,6 @@ def calculate_indicators(df):
         df['bb_upper'] = bb.bollinger_hband()
         df['bb_mid'] = bb.bollinger_mavg()
         df['bb_lower'] = bb.bollinger_lband()
-        df['bb_width'] = bb.bollinger_wband()
         
         # Moving Averages
         df['ma20'] = ta.trend.SMAIndicator(c, window=20).sma_indicator()
@@ -284,7 +307,7 @@ def calculate_indicators(df):
         df['ema9'] = ta.trend.EMAIndicator(c, window=9).ema_indicator()
         df['ema21'] = ta.trend.EMAIndicator(c, window=21).ema_indicator()
         
-        # ATR
+        # ATR (for stop loss calculation)
         df['atr'] = ta.volatility.AverageTrueRange(h, l, c, window=14).average_true_range()
         
         # Stochastic
@@ -292,10 +315,7 @@ def calculate_indicators(df):
         df['stoch_k'] = stoch.stoch()
         df['stoch_d'] = stoch.stoch_signal()
         
-        # OBV
-        df['obv'] = ta.volume.OnBalanceVolumeIndicator(c, v).on_balance_volume()
-        
-        # ADX
+        # ADX (trend strength)
         adx = ta.trend.ADXIndicator(h, l, c, window=14)
         df['adx'] = adx.adx()
         
@@ -319,13 +339,11 @@ def get_indicator_snapshot(df):
     def safe(val, default=50):
         try:
             v = float(val)
-            if pd.isna(v) or v == 0:
-                return default
-            return v
+            return default if pd.isna(v) or v == 0 else v
         except:
             return default
 
-    close = safe(last['close'], BASE_PRICES.get('BTC', 85000))
+    close = safe(last['close'])
     bb_upper = safe(last['bb_upper'], close * 1.05)
     bb_lower = safe(last['bb_lower'], close * 0.95)
     bb_range = bb_upper - bb_lower
@@ -353,7 +371,6 @@ def get_indicator_snapshot(df):
         'bb_lower': round(bb_lower, 4),
         'bb_mid': round(safe(last['bb_mid'], close), 4),
         'bb_pos': round(bb_pos, 1),
-        'bb_width': round(safe(last['bb_width']), 4),
         'ma20': round(ma20, 4),
         'ma50': round(ma50, 4),
         'ema9': round(safe(last['ema9'], close), 4),
@@ -364,7 +381,6 @@ def get_indicator_snapshot(df):
         'stoch_k': round(safe(last['stoch_k'], 50), 2),
         'stoch_d': round(safe(last['stoch_d'], 50), 2),
         'adx': round(safe(last['adx'], 20), 2),
-        'obv_rising': safe(last['obv']) > safe(prev['obv']),
     }
 
 
@@ -376,25 +392,16 @@ def detect_patterns(df):
     detected = []
     try:
         c = df.iloc[-1]
-
+        
         def body(candle): return abs(float(candle['close']) - float(candle['open']))
         def range_(candle): return float(candle['high']) - float(candle['low'])
-        def is_bull(candle): return float(candle['close']) > float(candle['open'])
-
+        
         bc = body(c)
         rc = range_(c)
-        bull_c = is_bull(c)
-        uw_c = float(c['high']) - max(float(c['close']), float(c['open']))
-        lw_c = min(float(c['close']), float(c['open'])) - float(c['low'])
-
-        # Single candle patterns
-        if rc > 0 and bc > 0:
-            # Hammer
-            if lw_c >= 2*bc and uw_c <= bc*0.3 and not bull_c:
-                detected.append({'id': 'hammer', 'name': 'Hammer', 'signal': 'BULLISH', 'reliability': 72, 'category': 'Candlestick'})
-            # Doji
-            if bc <= rc*0.1:
-                detected.append({'id': 'doji', 'name': 'Doji', 'signal': 'NEUTRAL', 'reliability': 55, 'category': 'Candlestick'})
+        
+        if rc > 0 and bc > 0 and bc <= rc * 0.1:
+            detected.append({'id': 'doji', 'name': 'Doji', 'signal': 'NEUTRAL', 'reliability': 55, 'category': 'Candlestick'})
+            
     except Exception as e:
         log.debug(f"Pattern detection error: {e}")
     
@@ -402,7 +409,7 @@ def detect_patterns(df):
 
 
 def generate_signal(indicators, patterns, sentiment_score, pattern_weights):
-    """Combine all signals into LONG/SHORT/HOLD with confidence score."""
+    """Generate trading signals based on indicators."""
     if not indicators:
         return {'signal': 'HOLD', 'bull_score': 0, 'bear_score': 0, 'confidence': 0, 'reasons': ['No data']}
         
@@ -415,15 +422,9 @@ def generate_signal(indicators, patterns, sentiment_score, pattern_weights):
     if rsi < 30:
         bull += 3
         reasons.append(f'RSI oversold ({rsi:.1f})')
-    elif rsi < 40:
-        bull += 1.5
-        reasons.append(f'RSI low ({rsi:.1f})')
     elif rsi > 70:
         bear += 3
         reasons.append(f'RSI overbought ({rsi:.1f})')
-    elif rsi > 60:
-        bear += 1.5
-        reasons.append(f'RSI high ({rsi:.1f})')
 
     # MACD
     if indicators['macd_cross_bull']:
@@ -444,15 +445,9 @@ def generate_signal(indicators, patterns, sentiment_score, pattern_weights):
     if bp < 15:
         bull += 2.5
         reasons.append(f'Price at BB lower ({bp:.0f}%)')
-    elif bp < 30:
-        bull += 1
-        reasons.append(f'Price near BB lower')
     elif bp > 85:
         bear += 2.5
         reasons.append(f'Price at BB upper ({bp:.0f}%)')
-    elif bp > 70:
-        bear += 1
-        reasons.append(f'Price near BB upper')
 
     total = bull + bear
     confidence = abs(bull - bear) / total * 100 if total > 0 else 0
@@ -474,7 +469,7 @@ def generate_signal(indicators, patterns, sentiment_score, pattern_weights):
 
 
 def paper_trade(pair, signal_data, price):
-    """Execute paper trade for a specific pair."""
+    """Execute paper trade with stop loss and take profit."""
     ps = paper_states[pair]
     result = {'action': 'none', 'pair': pair, 'price': price}
 
@@ -484,6 +479,7 @@ def paper_trade(pair, signal_data, price):
         pos = ps['position']
         sl = ps['stop_loss']
         tp = ps['take_profit']
+        
         hit_sl = (pos == 'long' and price <= sl) or (pos == 'short' and price >= sl)
         hit_tp = (pos == 'long' and price >= tp) or (pos == 'short' and price <= tp)
 
@@ -491,24 +487,28 @@ def paper_trade(pair, signal_data, price):
             pnl = ((price - entry) / entry if pos == 'long' else (entry - price) / entry) * TRADE_AMOUNT * LEVERAGE
             ps['balance'] += pnl
             ps['total_pnl'] += pnl
+            
+            outcome = 'WIN' if pnl > 0 else 'LOSS'
             if pnl > 0:
                 ps['wins'] += 1
             else:
                 ps['losses'] += 1
+                
             trade = {
                 'pair': pair,
                 'type': pos.upper(),
                 'entry': entry,
                 'exit': price,
                 'pnl': round(pnl, 2),
-                'outcome': 'WIN' if pnl > 0 else 'LOSS',
+                'outcome': outcome,
                 'reason': 'STOP LOSS' if hit_sl else 'TAKE PROFIT',
                 'time': datetime.now().isoformat(),
             }
             ps['trades'].append(trade)
             ps['position'] = ps['entry_price'] = ps['stop_loss'] = ps['take_profit'] = None
+            
             result = {'action': 'close', 'pair': pair, 'price': price, 'pnl': round(pnl, 2),
-                      'outcome': trade['outcome'], 'message': f"[{pair}] {trade['outcome']} ${pnl:+.2f}"}
+                      'outcome': outcome, 'message': f"[{pair}] {outcome} ${pnl:+.2f}"}
             return result, trade
 
     # Open new position
@@ -520,11 +520,13 @@ def paper_trade(pair, signal_data, price):
         else:
             sl = round(price * (1 + STOP_LOSS_PCT / 100), 6)
             tp = round(price * (1 - TAKE_PROFIT_PCT / 100), 6)
+            
         ps['position'] = sig.lower()
         ps['entry_price'] = price
         ps['entry_time'] = datetime.now().isoformat()
         ps['stop_loss'] = sl
         ps['take_profit'] = tp
+        
         result = {'action': 'open', 'pair': pair, 'type': sig, 'entry': price, 'sl': sl, 'tp': tp,
                   'message': f"[PAPER][{pair}] {sig} @ ${price:.4f} SL:${sl:.4f} TP:${tp:.4f}"}
 
@@ -532,17 +534,19 @@ def paper_trade(pair, signal_data, price):
 
 
 def get_pair_state(pair):
-    """Clean state dict for dashboard."""
+    """Get current trading state for dashboard."""
     ps = paper_states[pair]
     total = ps['wins'] + ps['losses']
     win_rate = (ps['wins'] / total * 100) if total > 0 else 0
     price = get_price(pair) or 0
+    
     unrealized = 0
     if ps['position'] and ps['entry_price'] and price:
         if ps['position'] == 'long':
             unrealized = (price - ps['entry_price']) / ps['entry_price'] * TRADE_AMOUNT * LEVERAGE
         else:
             unrealized = (ps['entry_price'] - price) / ps['entry_price'] * TRADE_AMOUNT * LEVERAGE
+            
     return {
         'pair': pair,
         'balance': round(ps['balance'], 2),
@@ -562,4 +566,5 @@ def get_pair_state(pair):
 
 
 def get_all_states():
+    """Get states for all pairs."""
     return {pair: get_pair_state(pair) for pair in ACTIVE_PAIRS}
